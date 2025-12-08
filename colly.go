@@ -129,13 +129,17 @@ type Collector struct {
 	requestCallbacks         []RequestCallback
 	responseCallbacks        []ResponseCallback
 	responseHeadersCallbacks []ResponseHeadersCallback
+	requestHeadersCallbacks  []RequestCallback
 	errorCallbacks           []ErrorCallback
 	scrapedCallbacks         []ScrapedCallback
-	requestCount             uint32
-	responseCount            uint32
+	requestCount             atomic.Uint32
+	responseCount            atomic.Uint32
 	backend                  *httpBackend
 	wg                       *sync.WaitGroup
 	lock                     *sync.RWMutex
+	// CacheExpiration sets the maximum age for cache files.
+	// If a cached file is older than this duration, it will be ignored and refreshed.
+	CacheExpiration time.Duration
 }
 
 // RequestCallback is a type alias for OnRequest callback functions
@@ -206,7 +210,10 @@ var collectorCounter uint32
 type key int
 
 // ProxyURLKey is the context key for the request proxy address.
-const ProxyURLKey key = iota
+const (
+	ProxyURLKey key = iota
+	CheckRevisitKey
+)
 
 var (
 	// ErrForbiddenDomain is the error thrown if visiting
@@ -233,6 +240,8 @@ var (
 	ErrEmptyProxyURL = errors.New("Proxy URL list is empty")
 	// ErrAbortedAfterHeaders is the error returned when OnResponseHeaders aborts the transfer.
 	ErrAbortedAfterHeaders = errors.New("Aborted after receiving response headers")
+	// ErrAbortedBeforeRequest is the error returned when OnResponseHeaders aborts the transfer.
+	ErrAbortedBeforeRequest = errors.New("Aborted before Do Request")
 	// ErrQueueFull is the error returned when the queue is full
 	ErrQueueFull = errors.New("Queue MaxSize reached")
 	// ErrMaxRequests is the error returned when exceeding max requests
@@ -468,10 +477,18 @@ func CheckHead() CollectorOption {
 	}
 }
 
+// CacheExpiration sets the maximum age for cache files.
+// If a cached file is older than this duration, it will be ignored and refreshed.
+func CacheExpiration(d time.Duration) CollectorOption {
+	return func(c *Collector) {
+		c.CacheExpiration = d
+	}
+}
+
 // Init initializes the Collector's private variables and sets default
 // configuration for the Collector
 func (c *Collector) Init() {
-	c.UserAgent = "colly - https://github.com/gocolly/colly/v2"
+	c.UserAgent = "colly - https://github.com/gocolly/colly"
 	c.Headers = nil
 	c.MaxDepth = 0
 	c.MaxRequests = 0
@@ -607,7 +624,7 @@ func (c *Collector) UnmarshalRequest(r []byte) (*Request, error) {
 		Depth:     req.Depth,
 		Body:      bytes.NewReader(req.Body),
 		Ctx:       ctx,
-		ID:        atomic.AddUint32(&c.requestCount, 1),
+		ID:        c.requestCount.Add(1),
 		Headers:   &req.Headers,
 		collector: c,
 	}, nil
@@ -654,7 +671,8 @@ func (c *Collector) scrape(u, method string, depth int, requestData io.Reader, c
 	}
 	// note: once 1.13 is minimum supported Go version,
 	// replace this with http.NewRequestWithContext
-	req = req.WithContext(c.Context)
+	req = req.WithContext(context.WithValue(c.Context, CheckRevisitKey, checkRevisit))
+
 	if err := c.requestCheck(parsedURL, method, req.GetBody, depth, checkRevisit); err != nil {
 		return err
 	}
@@ -681,7 +699,7 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		Method:    method,
 		Body:      requestData,
 		collector: c,
-		ID:        atomic.AddUint32(&c.requestCount, 1),
+		ID:        c.requestCount.Add(1),
 	}
 
 	if req.Header.Get("Accept") == "" {
@@ -704,7 +722,7 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		req = hTrace.WithTrace(req)
 	}
 	origURL := req.URL
-	checkHeadersFunc := func(req *http.Request, statusCode int, headers http.Header) bool {
+	checkResponseHeadersFunc := func(req *http.Request, statusCode int, headers http.Header) bool {
 		if req.URL != origURL {
 			request.URL = req.URL
 			request.Headers = &req.Header
@@ -712,14 +730,18 @@ func (c *Collector) fetch(u, method string, depth int, requestData io.Reader, ct
 		c.handleOnResponseHeaders(&Response{Ctx: ctx, Request: request, StatusCode: statusCode, Headers: &headers})
 		return !request.abort
 	}
-	response, err := c.backend.Cache(req, c.MaxBodySize, checkHeadersFunc, c.CacheDir)
+	checkRequestHeadersFunc := func(req *http.Request) bool {
+		c.handleOnRequestHeaders(request)
+		return !request.abort
+	}
+	response, err := c.backend.Cache(req, c.MaxBodySize, checkRequestHeadersFunc, checkResponseHeadersFunc, c.CacheDir, c.CacheExpiration)
 	if proxyURL, ok := req.Context().Value(ProxyURLKey).(string); ok {
 		request.ProxyURL = proxyURL
 	}
 	if err := c.handleOnError(response, err, request, ctx); err != nil {
 		return err
 	}
-	atomic.AddUint32(&c.responseCount, 1)
+	c.responseCount.Add(1)
 	response.Ctx = ctx
 	response.Request = request
 	response.Trace = hTrace
@@ -751,7 +773,7 @@ func (c *Collector) requestCheck(parsedURL *url.URL, method string, getBody func
 	if c.MaxDepth > 0 && c.MaxDepth < depth {
 		return ErrMaxDepth
 	}
-	if c.MaxRequests > 0 && c.requestCount >= c.MaxRequests {
+	if c.MaxRequests > 0 && c.requestCount.Load() >= c.MaxRequests {
 		return ErrMaxRequests
 	}
 	if err := c.checkFilters(u, parsedURL.Hostname()); err != nil {
@@ -810,20 +832,13 @@ func (c *Collector) checkFilters(URL, domain string) error {
 }
 
 func (c *Collector) isDomainAllowed(domain string) bool {
-	for _, d2 := range c.DisallowedDomains {
-		if d2 == domain {
-			return false
-		}
+	if slices.Contains(c.DisallowedDomains, domain) {
+		return false
 	}
 	if c.AllowedDomains == nil || len(c.AllowedDomains) == 0 {
 		return true
 	}
-	for _, d2 := range c.AllowedDomains {
-		if d2 == domain {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.AllowedDomains, domain)
 }
 
 func (c *Collector) checkRobots(u *url.URL) error {
@@ -892,8 +907,8 @@ func (c *Collector) checkRobots(u *url.URL) error {
 func (c *Collector) String() string {
 	return fmt.Sprintf(
 		"Requests made: %d (%d responses) | Callbacks: OnRequest: %d, OnHTML: %d, OnResponse: %d, OnError: %d",
-		atomic.LoadUint32(&c.requestCount),
-		atomic.LoadUint32(&c.responseCount),
+		c.requestCount.Load(),
+		c.responseCount.Load(),
 		len(c.requestCallbacks),
 		len(c.htmlCallbacks),
 		len(c.responseCallbacks),
@@ -931,6 +946,14 @@ func (c *Collector) OnRequest(f RequestCallback) {
 func (c *Collector) OnResponseHeaders(f ResponseHeadersCallback) {
 	c.lock.Lock()
 	c.responseHeadersCallbacks = append(c.responseHeadersCallbacks, f)
+	c.lock.Unlock()
+}
+
+// OnRequestHeaders registers a function. Function will be executed on every
+// request made by the Collector before Request Do
+func (c *Collector) OnRequestHeaders(f RequestCallback) {
+	c.lock.Lock()
+	c.requestHeadersCallbacks = append(c.requestHeadersCallbacks, f)
 	c.lock.Unlock()
 }
 
@@ -1079,7 +1102,7 @@ func (c *Collector) SetProxy(proxyURL string) error {
 // SetProxyFunc sets a custom proxy setter/switcher function.
 // See built-in ProxyFuncs for more details.
 // This method overrides the previously used http.Transport
-// if the type of the transport is not http.RoundTripper.
+// if the type of the transport is not *http.Transport.
 // The proxy type is determined by the URL scheme. "http"
 // and "socks5" are supported. If the scheme is empty,
 // "http" is assumed.
@@ -1136,6 +1159,16 @@ func (c *Collector) handleOnResponseHeaders(r *Response) {
 		}))
 	}
 	for _, f := range c.responseHeadersCallbacks {
+		f(r)
+	}
+}
+func (c *Collector) handleOnRequestHeaders(r *Request) {
+	if c.debugger != nil {
+		c.debugger.Event(createEvent("requestHeaders", r.ID, c.ID, map[string]string{
+			"url": r.URL.String(),
+		}))
+	}
+	for _, f := range c.requestHeadersCallbacks {
 		f(r)
 	}
 }
@@ -1237,8 +1270,9 @@ func (c *Collector) handleOnXML(resp *Response) error {
 			if !cc.active.Load() {
 				continue
 			}
-			for _, n := range htmlquery.Find(doc, cc.Query) {
+			for i, n := range htmlquery.Find(doc, cc.Query) {
 				e := NewXMLElementFromHTMLNode(resp, n)
+				e.Index = i
 				if c.debugger != nil {
 					c.debugger.Event(createEvent("xml", resp.Request.ID, c.ID, map[string]string{
 						"selector": cc.Query,
@@ -1382,6 +1416,7 @@ func (c *Collector) Clone() *Collector {
 		AllowedDomains:         c.AllowedDomains,
 		AllowURLRevisit:        c.AllowURLRevisit,
 		CacheDir:               c.CacheDir,
+		CacheExpiration:        c.CacheExpiration,
 		DetectCharset:          c.DetectCharset,
 		DisallowedDomains:      c.DisallowedDomains,
 		ID:                     atomic.AddUint32(&collectorCounter, 1),
@@ -1441,7 +1476,9 @@ func (c *Collector) checkRedirectFunc() func(req *http.Request, via []*http.Requ
 				return err
 			}
 			if visited {
-				return &AlreadyVisitedError{req.URL}
+				if checkRevisit, ok := req.Context().Value(CheckRevisitKey).(bool); !ok || checkRevisit {
+					return &AlreadyVisitedError{req.URL}
+				}
 			}
 			err = c.store.Visited(uHash)
 			if err != nil {

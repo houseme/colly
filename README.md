@@ -15,10 +15,6 @@ With Colly you can easily extract structured data from websites, which can be us
 [![Twitter URL](https://img.shields.io/badge/twitter-follow-green.svg)](https://twitter.com/gocolly)
 
 
-------
-
-
-
 ## Features
 
 -   Clean API
@@ -67,13 +63,7 @@ See [examples folder](https://github.com/gocolly/colly/tree/master/_examples) fo
 Add colly to your `go.mod` file:
 
 ```
-module github.com/x/y
-
-go 1.21
-
-require (
-        github.com/gocolly/colly/v2 latest
-)
+`go get github.com/gocolly/colly/v2`
 ```
 
 ## Bugs

@@ -401,6 +401,19 @@ var newCollectorTests = map[string]func(*testing.T){
 			}
 		}
 	},
+	"CacheExpiration": func(t *testing.T) {
+		for _, d := range []time.Duration{
+			5 * time.Second,
+			10 * time.Minute,
+			0,
+		} {
+			c := NewCollector(CacheExpiration(d))
+
+			if got, want := c.CacheExpiration, d; got != want {
+				t.Fatalf("c.CacheExpiration = %v, want %v", got, want)
+			}
+		}
+	},
 	"IgnoreRobotsTxt": func(t *testing.T) {
 		c := NewCollector(IgnoreRobotsTxt())
 
@@ -891,7 +904,7 @@ func TestCollectorPostURLRevisitCheck(t *testing.T) {
 	}
 }
 
-// TestCollectorURLRevisitDisallowed ensures that disallowed URL is not considered visited.
+// TestCollectorURLRevisitDomainDisallowed ensures that disallowed URL is not considered visited.
 func TestCollectorURLRevisitDomainDisallowed(t *testing.T) {
 	ts := newTestServer()
 	defer ts.Close()
@@ -1280,7 +1293,7 @@ func TestEnvSettings(t *testing.T) {
 func TestUserAgent(t *testing.T) {
 	const exampleUserAgent1 = "Example/1.0"
 	const exampleUserAgent2 = "Example/2.0"
-	const defaultUserAgent = "colly - https://github.com/gocolly/colly/v2"
+	const defaultUserAgent = "colly - https://github.com/gocolly/colly"
 
 	ts := newTestServer()
 	defer ts.Close()
@@ -1869,5 +1882,47 @@ func TestCollectorPostRetryUnseekable(t *testing.T) {
 	c.Request("POST", ts.URL+"/login", bytes.NewBuffer([]byte("name="+postValue)), nil, nil)
 	if try {
 		t.Error("OnResponse Retry was called but BodyUnseekable")
+	}
+}
+
+func TestRedirectErrorRetry(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+	c := NewCollector()
+	c.OnError(func(r *Response, err error) {
+		if r.Ctx.Get("notFirst") == "" {
+			r.Ctx.Put("notFirst", "first")
+			_ = r.Request.Retry()
+			return
+		}
+		if e := (&AlreadyVisitedError{}); errors.As(err, &e) {
+			t.Error("loop AlreadyVisitedError")
+		}
+
+	})
+	c.OnResponse(func(response *Response) {
+		//println(1)
+	})
+	c.Visit(ts.URL + "/redirected/")
+	c.Visit(ts.URL + "/redirect")
+}
+
+func TestCheckRequestHeadersFunc(t *testing.T) {
+	ts := newTestServer()
+	defer ts.Close()
+	try := false
+
+	c := NewCollector()
+
+	c.OnRequestHeaders(func(r *Request) {
+		try = true
+		r.Abort()
+	})
+	c.OnScraped(func(r *Response) {
+		try = false
+	})
+	c.Visit(ts.URL)
+	if try == false {
+		t.Error("TestCheckRequestHeadersFunc failed")
 	}
 }
